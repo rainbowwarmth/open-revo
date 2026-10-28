@@ -40,18 +40,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      # pnpm must be installed before setup-node so its pnpm store cache can be resolved.
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
-          run_install: false
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'pnpm'
+
+      # Do NOT use pnpm/action-setup here. On hosted Windows runners pnpm ships preinstalled,
+      # and the action's self-installer prints "Installation Completed!" then exits 1 anyway,
+      # which fails the whole job. A pinned global npm install is deterministic and readable.
+      - name: Install pnpm (pinned)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm install -g "pnpm@$env:PNPM_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+              throw "npm install -g pnpm@$env:PNPM_VERSION failed with exit code $LASTEXITCODE"
+          }
+          # Hosted images may ship another pnpm earlier on PATH; put ours first.
+          $globalBin = (npm prefix -g).Trim()
+          if ($globalBin) {
+              $globalBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+              Write-Host "[*] Prepended npm global bin to PATH: $globalBin"
+          }
+
+      - name: Verify pnpm Version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $actual = (pnpm --version).Trim()
+          Write-Host "pnpm version: $actual (expected $env:PNPM_VERSION)"
+          if ($actual -ne $env:PNPM_VERSION) {
+              throw "pnpm version mismatch: expected $env:PNPM_VERSION but resolved $actual"
+          }
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
