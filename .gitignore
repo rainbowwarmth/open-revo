@@ -54,3 +54,4 @@ safe_*.ps1
 run_*.bat
 check_vault_leaks.ps1
 scripts/
+.workbuddy

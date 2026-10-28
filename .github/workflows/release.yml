@@ -20,6 +20,15 @@ on:
 permissions:
   contents: write
 
+# Never cancel an in-flight release: a half-published release is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PNPM_VERSION: '9.15.9'
+  CARGO_TERM_COLOR: always
+
 jobs:
   build-windows:
     name: Build & Package Windows (x64)
@@ -31,15 +40,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # pnpm must be installed before setup-node so its pnpm store cache can be resolved.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          run_install: false
+          cache: 'pnpm'
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -57,17 +69,23 @@ jobs:
       - name: Verify Hardware Vault Gatekeeper
         shell: pwsh
         run: |
-          if (Test-Path "./scripts/check_vault_leaks.ps1") {
+          $ErrorActionPreference = "Stop"
+          $gatekeeper = "./scripts/check_vault_leaks.ps1"
+          if (Test-Path -LiteralPath $gatekeeper) {
               Write-Host "[*] Running Vault Leak Gatekeeper..." -ForegroundColor Cyan
-              & ./scripts/check_vault_leaks.ps1
+              & $gatekeeper
+              if ($LASTEXITCODE -ne 0) { throw "Vault leak gatekeeper failed with exit code $LASTEXITCODE" }
           } else {
-              Write-Host "[*] Vault leak script not present in repository checkout, skipping check." -ForegroundColor Yellow
+              Write-Host "[!] $gatekeeper not present in checkout (excluded by .gitignore), skipping gate." -ForegroundColor Yellow
           }
 
-      - name: Build Standalone Executable
-        run: pnpm tauri build --no-bundle
+      # Fail fast on TypeScript / Vite errors instead of burning 10+ minutes of Rust compilation.
+      - name: Type-check & Build Frontend
+        run: pnpm build
 
-      - name: Build NSIS Installer
+      # Single compile pass: produces target/release/open-revo.exe plus the NSIS installer.
+      # bundle.active/targets are declared in src-tauri/tauri.conf.json; --bundles keeps it explicit.
+      - name: Build Executable & NSIS Installer
         run: pnpm tauri build --bundles nsis
 
       # ------------------------------------------------------------------------
@@ -84,46 +102,70 @@ jobs:
         id: prepare_artifacts
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $ver = (Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
           $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "v$ver-dev" }
-          Write-Host "Target Version: $ver | Tag: $tag" -ForegroundColor Green
+          $commit = (git rev-parse --short HEAD).Trim()
+          Write-Host "Version: $ver | Tag: $tag | Commit: $commit" -ForegroundColor Green
 
           $distDir = "dist_artifacts"
           New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
-          # 1. Standalone Exe
+          # 1. Standalone executable
           $srcExe = "src-tauri/target/release/open-revo.exe"
-          $destExe = "$distDir/open-revo.exe"
+          if (-not (Test-Path -LiteralPath $srcExe)) {
+              throw "Build output missing: $srcExe"
+          }
+          $destExe = Join-Path $distDir "open-revo.exe"
           Copy-Item -LiteralPath $srcExe -Destination $destExe -Force
+          Write-Host "[OK] Executable: open-revo.exe" -ForegroundColor Cyan
 
-          # 2. Portable 7z Archive
+          # 2. Portable archive
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) {
+              $candidate = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+              if (Test-Path -LiteralPath $candidate) { $sevenZip = $candidate }
+          }
+          if (-not $sevenZip) { throw "7-Zip not found on runner, cannot build portable archive" }
+
           $portableName = "OpenRevo-${tag}-portable.7z"
-          $dest7z = "$distDir/$portableName"
-          & 7z a -t7z -mx=9 "$dest7z" "$destExe"
+          $dest7z = Join-Path $distDir $portableName
+          & $sevenZip a -t7z -mx=9 $dest7z $destExe | Out-Null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $dest7z)) {
+              throw "7-Zip archive creation failed with exit code $LASTEXITCODE"
+          }
+          Write-Host "[OK] Portable: $portableName" -ForegroundColor Cyan
 
-          # 3. NSIS Installer
+          # 3. NSIS installer (hard requirement: never silently publish an exe-only release)
           $nsisSourceDir = "src-tauri/target/release/bundle/nsis"
-          $matchedNsis = Get-ChildItem -Path $nsisSourceDir -Filter "*.exe" | Select-Object -First 1
-          if ($matchedNsis) {
-              $installerName = "OpenRevo-${tag}-x64-Setup.exe"
-              $destInstaller = "$distDir/$installerName"
-              Copy-Item -LiteralPath $matchedNsis.FullName -Destination $destInstaller -Force
-              Write-Host "Found NSIS Installer: $installerName" -ForegroundColor Cyan
+          $matchedNsis = Get-ChildItem -Path $nsisSourceDir -Filter "*.exe" -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          if (-not $matchedNsis) {
+              throw "NSIS installer not found under $nsisSourceDir. Check 'tauri build --bundles nsis' output."
           }
+          $installerName = "OpenRevo-${tag}-x64-Setup.exe"
+          $destInstaller = Join-Path $distDir $installerName
+          Copy-Item -LiteralPath $matchedNsis.FullName -Destination $destInstaller -Force
+          Write-Host "[OK] Installer: $installerName" -ForegroundColor Cyan
 
-          # 4. Generate SHA256 Checksums
-          $checksumFile = "$distDir/checksums.txt"
-          Get-ChildItem -Path $distDir -Filter "*.*" | Where-Object { $_.Name -ne "checksums.txt" } | ForEach-Object {
-              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower()
-              "$hash  $($_.Name)" | Out-File -FilePath $checksumFile -Append -Encoding ascii
-          }
+          # 4. SHA256 checksums
+          $checksumFile = Join-Path $distDir "checksums.txt"
+          if (Test-Path -LiteralPath $checksumFile) { Remove-Item -LiteralPath $checksumFile -Force }
+          Get-ChildItem -Path $distDir -File | Where-Object { $_.Name -ne "checksums.txt" } |
+              Sort-Object Name |
+              ForEach-Object {
+                  $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower()
+                  "$hash  $($_.Name)" | Out-File -FilePath $checksumFile -Append -Encoding ascii
+              }
 
-          Write-Host "=== Artifacts Prepared ===" -ForegroundColor Green
+          Write-Host "=== Release Artifacts ===" -ForegroundColor Green
+          Get-ChildItem -Path $distDir -File | Format-Table Name, Length -AutoSize
           Get-Content $checksumFile
 
-          # Set output for subsequent steps
-          echo "tag_name=$tag" >> $env:GITHUB_OUTPUT
-          echo "app_version=$ver" >> $env:GITHUB_OUTPUT
+          "tag_name=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "app_version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Upload Build Artifacts (Workflow Storage)
         uses: actions/upload-artifact@v4
@@ -134,11 +176,12 @@ jobs:
 
       - name: Publish GitHub Release (Tag / Dispatch)
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.draft == 'true'
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.draft == true
         with:
           name: OpenRevo ${{ steps.prepare_artifacts.outputs.tag_name }}
           tag_name: ${{ steps.prepare_artifacts.outputs.tag_name }}
-          draft: ${{ github.event.inputs.draft == 'true' }}
-          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          draft: ${{ inputs.draft == true }}
+          prerelease: ${{ inputs.prerelease == true }}
           files: dist_artifacts/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
